@@ -243,6 +243,61 @@ class User:
 
             cursor = resp.get("cursor")
 
+    async def bookmarked(
+        self, count: int = 30, cursor: int = 0, **kwargs
+    ):
+        """
+        Returns a user's bookmarked posts. Requires a valid cookie upon initialization of `TikTokApi`
+
+        Args:
+            count (int): The amount of recent likes you want returned.
+            cursor (int): The the offset of likes from 0 you want to get.
+
+        Returns:
+            async iterator/generator: Yields TikTokApi.video objects.
+
+        Raises:
+            InvalidResponseException: Something screwed up!
+
+        Example Usage:
+            .. code-block:: python
+
+                async for like in api.user(username="davidteathercodes").bookmarked():
+                    # do something
+        """
+        sec_uid = getattr(self, "sec_uid", None)
+        if sec_uid is None or sec_uid == "":
+            await self.info(**kwargs)
+
+        found = 0
+        while found < count:
+            params = {
+                "secUid": self.sec_uid,
+                "count": min((35, (count - found))),
+                "cursor": cursor,
+            }
+
+            resp = await self.parent.make_request(
+                url="https://www.tiktok.com/api/user/collect/item_list",
+                params=params,
+                headers=kwargs.get("headers"),
+                session_index=kwargs.get("session_index"),
+            )
+
+            if resp is None:
+                raise InvalidResponseException(
+                    resp, "TikTok returned an invalid response."
+                )
+
+            for video in resp.get("itemList", []):
+                yield self.parent.video(data=video)
+                found += 1
+
+            if not resp.get("hasMore", False):
+                return
+
+            cursor = resp.get("cursor")
+
     def __extract_from_data(self):
         data = self.as_dict
         keys = data.keys()
