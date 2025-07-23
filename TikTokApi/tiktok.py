@@ -6,7 +6,7 @@ import random
 import time
 import json
 
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError
 from urllib.parse import urlencode, quote, urlparse
 from .stealth import stealth_async
 from .helpers import random_choice
@@ -18,6 +18,7 @@ from .api.hashtag import Hashtag
 from .api.comment import Comment
 from .api.trending import Trending
 from .api.search import Search
+from .api.playlist import Playlist
 
 from .exceptions import (
     InvalidJSONException,
@@ -55,6 +56,7 @@ class TikTokApi:
     comment = Comment
     trending = Trending
     search = Search
+    playlist = Playlist
 
     def __init__(self, logging_level: int = logging.WARN, logger_name: str = None):
         """
@@ -77,6 +79,7 @@ class TikTokApi:
         Comment.parent = self
         Trending.parent = self
         Search.parent = self
+        Playlist.parent = self
 
     def __create_logger(self, name: str, level: int = logging.DEBUG):
         """Create a logger for the class."""
@@ -143,62 +146,86 @@ class TikTokApi:
         sleep_after: int = 1,
         cookies: dict = None,
         suppress_resource_load_types: list[str] = None,
+        timeout: int = 30000,
     ):
-        """Create a TikTokPlaywrightSession"""
-        if ms_token is not None:
-            if cookies is None:
-                cookies = {}
-            cookies["msToken"] = ms_token
-
-        context = await self.browser.new_context(proxy=proxy, **context_options)
-        if cookies is not None:
-            formatted_cookies = [
-                {"name": k, "value": v, "domain": urlparse(url).netloc, "path": "/"}
-                for k, v in cookies.items()
-                if v is not None
-            ]
-            await context.add_cookies(formatted_cookies)
-        page = await context.new_page()
-        await stealth_async(page)
-
-        # Get the request headers to the url
-        request_headers = None
-
-        def handle_request(request):
-            nonlocal request_headers
-            request_headers = request.headers
-
-        page.once("request", handle_request)
-
-        if suppress_resource_load_types is not None:
-            await page.route(
-                "**/*",
-                lambda route, request: route.abort()
-                if request.resource_type in suppress_resource_load_types
-                else route.continue_(),
+        try:
+            """Create a TikTokPlaywrightSession"""
+            if ms_token is not None:
+                if cookies is None:
+                    cookies = {}
+                cookies["msToken"] = ms_token
+    
+            context = await self.browser.new_context(proxy=proxy, **context_options)
+            if cookies is not None:
+                formatted_cookies = [
+                    {"name": k, "value": v, "domain": urlparse(url).netloc, "path": "/"}
+                    for k, v in cookies.items()
+                    if v is not None
+                ]
+                await context.add_cookies(formatted_cookies)
+            page = await context.new_page()
+            await stealth_async(page)
+    
+            # Get the request headers to the url
+            request_headers = None
+    
+            def handle_request(request):
+                nonlocal request_headers
+                request_headers = request.headers
+    
+            page.once("request", handle_request)
+    
+            if suppress_resource_load_types is not None:
+                await page.route(
+                    "**/*",
+                    lambda route, request: route.abort()
+                    if request.resource_type in suppress_resource_load_types
+                    else route.continue_(),
+                )
+            
+            # Set the navigation timeout
+            page.set_default_navigation_timeout(timeout)
+    
+            await page.goto(url)
+            await page.goto(url) # hack: tiktok blocks first request not sure why, likely bot detection
+            
+            # by doing this, we are simulate scroll event using mouse to `avoid` bot detection
+            x, y = random.randint(0, 50), random.randint(0, 50)
+            a, b = random.randint(1, 50), random.randint(100, 200)
+    
+            await page.mouse.move(x, y)
+            await page.wait_for_load_state("networkidle")
+            await page.mouse.move(a, b)
+    
+            session = TikTokPlaywrightSession(
+                context,
+                page,
+                ms_token=ms_token,
+                proxy=proxy,
+                headers=request_headers,
+                base_url=url,
             )
 
-        await page.goto(url)
-
-        session = TikTokPlaywrightSession(
-            context,
-            page,
-            ms_token=ms_token,
-            proxy=proxy,
-            headers=request_headers,
-            base_url=url,
-        )
-        if ms_token is None:
-            time.sleep(sleep_after)  # TODO: Find a better way to wait for msToken
-            cookies = await self.get_session_cookies(session)
-            ms_token = cookies.get("msToken")
-            session.ms_token = ms_token
             if ms_token is None:
-                self.logger.info(
-                    f"Failed to get msToken on session index {len(self.sessions)}, you should consider specifying ms_tokens"
-                )
-        self.sessions.append(session)
-        await self.__set_session_params(session)
+                await asyncio.sleep(sleep_after)  # TODO: Find a better way to wait for msToken
+                cookies = await self.get_session_cookies(session)
+                ms_token = cookies.get("msToken")
+                session.ms_token = ms_token
+                if ms_token is None:
+                    self.logger.info(
+                        f"Failed to get msToken on session index {len(self.sessions)}, you should consider specifying ms_tokens"
+                    )
+            self.sessions.append(session)
+            await self.__set_session_params(session)
+        except Exception as e:
+            # clean up
+            self.logger.error(f"Failed to create session: {e}")
+            # Cleanup resources if they were partially created
+            if 'page' in locals():
+                await page.close()
+            if 'context' in locals():
+                await context.close()
+            raise  # Re-raise the exception after cleanup
 
     async def create_sessions(
         self,
@@ -213,7 +240,8 @@ class TikTokApi:
         cookies: list[dict] = None,
         suppress_resource_load_types: list[str] = None,
         browser: str = "chromium",
-        executable_path: str = None
+        executable_path: str = None,
+        timeout: int = 30000,
     ):
         """
         Create sessions for use within the TikTokApi class.
@@ -232,8 +260,9 @@ class TikTokApi:
             override_browser_args (list[dict]): A list of dictionaries containing arguments to pass to the browser.
             cookies (list[dict]): A list of cookies to use for the sessions, you can get these from your cookies after visiting TikTok.
             suppress_resource_load_types (list[str]): Types of resources to suppress playwright from loading, excluding more types will make playwright faster.. Types: document, stylesheet, image, media, font, script, textrack, xhr, fetch, eventsource, websocket, manifest, other.
-            browser (str): specify either firefox or chromium, default is chromium
+            browser (str): firefox, chromium, or webkit; default is chromium
             executable_path (str): Path to the browser executable
+            timeout (int): The timeout in milliseconds for page navigation
 
         Example Usage:
             .. code-block:: python
@@ -271,11 +300,11 @@ class TikTokApi:
                     sleep_after=sleep_after,
                     cookies=random_choice(cookies),
                     suppress_resource_load_types=suppress_resource_load_types,
+                    timeout=timeout,
                 )
                 for _ in range(num_sessions)
             )
         )
-        self.num_sessions = len(self.sessions)
 
     async def close_sessions(self):
         """
@@ -315,10 +344,13 @@ class TikTokApi:
             int: The index of the session.
             TikTokPlaywrightSession: The session.
         """
+        if len(self.sessions) == 0:
+            raise Exception("No sessions created, please create sessions first")
+
         if kwargs.get("session_index") is not None:
             i = kwargs["session_index"]
         else:
-            i = random.randint(0, self.num_sessions - 1)
+            i = random.randint(0, len(self.sessions) - 1)
         return i, self.sessions[i]
 
     async def set_session_cookies(self, session, cookies):
@@ -363,7 +395,23 @@ class TikTokApi:
     async def generate_x_bogus(self, url: str, **kwargs):
         """Generate the X-Bogus header for a url"""
         _, session = self._get_session(**kwargs)
-        await session.page.wait_for_function("window.byted_acrawler !== undefined")
+
+        max_attempts = 5
+        attempts = 0
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                timeout_time = random.randint(5000, 20000)
+                await session.page.wait_for_function("window.byted_acrawler !== undefined", timeout=timeout_time)
+                break
+            except TimeoutError as e:
+                if attempts == max_attempts:
+                    raise TimeoutError(f"Failed to load tiktok after {max_attempts} attempts, consider using a proxy")
+                
+                try_urls = ["https://www.tiktok.com/foryou", "https://www.tiktok.com", "https://www.tiktok.com/@tiktok", "https://www.tiktok.com/foryou"]
+
+                await session.page.goto(random.choice(try_urls))
+        
         result = await session.page.evaluate(
             f'() => {{ return window.byted_acrawler.frontierSign("{url}") }}'
         )
@@ -452,7 +500,7 @@ class TikTokApi:
                 raise Exception("TikTokApi.run_fetch_script returned None")
 
             if result == "":
-                raise EmptyResponseException(result, "TikTok returned an empty response")
+                raise EmptyResponseException(result, "TikTok returned an empty response. They are detecting you're a bot, try some of these: headless=False, browser='webkit', consider using a proxy")
 
             try:
                 data = json.loads(result)
